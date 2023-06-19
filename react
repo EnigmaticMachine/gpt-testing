@@ -1,0 +1,1003 @@
+ReAct (Reason+Act) prompting in OpenAI GPT and LangChain
+BY TSUYOSHI MATSUZAKI ON 2023-03-07 • ( 18 COMMENTS )
+LangChain is an open-source tool to help you compose a variety of language chains (such as, chat system, QA system, etc) in LLMs, and it also has a framework to build an autonomous agent by Reasoning+Acting, shortly ReAct.
+In this post, I’ll briefly show you “What is ReAct under the hood ?”, “How it works ?”, and “How to build?” with OpenAI GPT and widely-used LangChain.
+
+Currently a lot of tools and open sources – such as, Auto-GPT, HuggingGPT (JARVIS), etc – automate a variety of tasks with reasoning on LLMs, and this post will give you a hint for building such an autonomous agent.
+
+ReAct (Reasoning + Acting) – Collaboration with LLMs and external tools
+Integrating LLMs (Large Language Models) with external tools will be very often needed in the real business applications.
+For instance, Microsoft has integrated OpenAI LLMs with their Office applications in Microsoft 365 Copilot.
+Another example is the search. LLMs doesn’t always give correct answers, and the method to interact with external search engine (for both internet and intranet) is then often applied in QA system.
+The flexible architectures with combination between LLM’s reasoning and additional experts are then proposed in several papers – such as, ReAct (Reasoning + Acting) or MRKL (Modular Reasoning, Knowledge and Language).
+
+ReAct is a framework which has been introduced in this paper (Shunyu et al., 2022), and it improves decision making by integrating LLMs with the external tools.
+As you can see in this post, this is so flexible and you can then apply this method in various types of automation (orchestration) between LLMs and external tools.
+
+For instance, we can define the action “search [entity]” which returns the sentences from the corresponding Wikipedia entity, and the multi-hop questions (which cannot be answered from a single Wikipedia entity, but can be answered by referencing the multiple entities) can be disassembled into multiple search actions. All search actions will then be processed by external tools. Finally, the answer can be obtained by question-answering with LLMs. (See below for the example in the paper.)
+
+
+
+From “REACT: SYNERGIZING REASONING AND ACTING IN LANGUAGE MODELS” (Shunyu et al., 2022)
+
+Note : In benchmarking in this paper, “lookup [entity]” action is also introduced, which returns the next sentence in the page containing string, simulating Ctrl+F functionality on the browser.
+These actions (search, lookup) is simulating human behaviors in human response.
+
+As you can see later, a LLM reasons to call an external tool, gets halted to fetch the tool’s response as observation, and then decides the next action based on all preceding responses.
+This technique is also sometimes referred as Augmented Language Models (ALMs).
+
+This reasoning and acting can be performed by few-shot in-context prompting, or it can also be learned by reinforcement learning or imitation learning (with expert data) in more advanced approaches.
+
+In this post, we will see this ReAct example with few-shot prompting.
+
+Setup LangChain environment
+In this example, I have used Ubuntu Server 20.04 LTS in Microsoft Azure.
+
+In this virtual machine, it already has Python 3.8 and you just install additional packages for running examples as follows.
+
+# Update pip
+sudo apt-get update
+sudo apt-get install -y python3-pip
+sudo -H pip3 install --upgrade pip
+
+# Install packages
+pip3 install openai
+pip3 install langchain==0.0.100
+pip3 install wikipedia
+Before running application, you should set the environment variables for Azure OpenAI integration in LangChain. (See this document to use Azure OpenAI Service in LangChain.)
+
+export OPENAI_API_TYPE=azure
+export OPENAI_API_VERSION=2022-12-01
+export OPENAI_API_BASE=https://your-resource-name.openai.azure.com
+export OPENAI_API_KEY="..."
+Run Your First ReAct with LangChain
+Now let’s start your first ReAct chain.
+
+This is Wikipedia docstore example included in LangChain, in which the question is disassembled into multiple search actions.
+In this demonstration, I have used text-davinci-003 (GPT-3.5) model with temperature 0.0 in OpenAI GPT.
+In the following code, it finally executes ReAct chain by run() function to get the answer for the following question :
+
+“Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?”
+
+from langchain.docstore.wikipedia import Wikipedia
+from langchain.llms import AzureOpenAI
+from langchain.agents import initialize_agent, Tool, AgentExecutor
+from langchain.agents.react.base import DocstoreExplorer
+
+# build tools
+docstore=DocstoreExplorer(Wikipedia())
+tools = [
+  Tool(
+    name="Search",
+    func=docstore.search,
+    description="Search for a term in the docstore.",
+  ),
+  Tool(
+    name="Lookup",
+    func=docstore.lookup,
+    description="Lookup a term in the docstore.",
+  )
+]
+
+# build LLM
+llm = AzureOpenAI(
+  deployment_name="davinci003-deploy",
+  model_name="text-davinci-003",
+  temperature=0,
+)
+
+# initialize ReAct agent
+react = initialize_agent(tools, llm, agent="react-docstore", verbose=True)
+agent_executor = AgentExecutor.from_agent_and_tools(
+  agent=react.agent,
+  tools=tools,
+  verbose=True,
+)
+
+# perform question-answering
+question = "Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?"
+agent_executor.run(question)
+This question cannot be answered by referring a single Wikipedia article, and it then needs multi-hop search actions.
+
+When you run this application, the following verbose outputs will be shown in the logs.
+As you can find, this question is disassembled into 3 search actions (“Search[David Chanoff]“, “Search[U.S. Navy admiral]“, and “Search[Admiral William J. Crowe]“) in order, and it gets the final answer “Bill Clinton”.
+
+
+
+What LangChain is doing inside ? (Demystifying ReAct)
+Now let’s see how it works inside LangChain, and dive into the implementation of ReAct framework.
+
+In the bottom of this chain, the following prompt is issued into OpenAI GPT. (You can see the prompt’s template by running the following code.)
+The former part (which is a long long text) in the following prompt’s template is few-shot’s in-context examples. OpenAI will then learn how to generate text for a target question with these few-shot’s examples.
+The last part (last 2 lines in output) is a target question and the {input} and {agent_scratchpad} placeholders will be replaced by LangChain framework depending on user’s inputs and chain steps. (I’ll show you the example soon.)
+
+# output prompt's template
+print(react.agent.llm_chain.prompt.template)
+output
+
+
+
+Question: What is the elevation range for the area that the eastern sector of the
+Colorado orogeny extends into?
+Thought 1: I need to search Colorado orogeny, find the area that the eastern sector
+of the Colorado orogeny extends into, then find the elevation range of the
+area.
+Action 1: Search[Colorado orogeny]
+Observation 1: The Colorado orogeny was an episode of mountain building (an orogeny) in
+Colorado and surrounding areas.
+Thought 2: It does not mention the eastern sector. So I need to look up eastern
+sector.
+Action 2: Lookup[eastern sector]
+Observation 2: (Result 1 / 1) The eastern sector extends into the High Plains and is called
+the Central Plains orogeny.
+Thought 3: The eastern sector of Colorado orogeny extends into the High Plains. So I
+need to search High Plains and find its elevation range.
+Action 3: Search[High Plains]
+Observation 3: High Plains refers to one of two distinct land regions
+Thought 4: I need to instead search High Plains (United States).
+Action 4: Search[High Plains (United States)]
+Observation 4: The High Plains are a subregion of the Great Plains. From east to west, the
+High Plains rise in elevation from around 1,800 to 7,000 ft (550 to 2,130
+m).[3]
+Thought 5: High Plains rise in elevation from around 1,800 to 7,000 ft, so the answer
+is 1,800 to 7,000 ft.
+Action 5: Finish[1,800 to 7,000 ft]
+
+Question: Musician and satirist Allie Goertz wrote a song about the "The Simpsons"
+character Milhouse, who Matt Groening named after who?
+Thought 1: The question simplifies to "The Simpsons" character Milhouse is named after
+who. I only need to search Milhouse and find who it is named after.
+Action 1: Search[Milhouse]
+Observation 1: Milhouse Mussolini Van Houten is a recurring character in the Fox animated
+television series The Simpsons voiced by Pamela Hayden and created by Matt
+Groening.
+Thought 2: The paragraph does not tell who Milhouse is named after, maybe I can look up
+"named after".
+Action 2: Lookup[named after]
+Observation 2: (Result 1 / 1) Milhouse was named after U.S. president Richard Nixon, whose
+middle name was Milhous.
+Thought 3: Milhouse was named after U.S. president Richard Nixon, so the answer is
+Richard Nixon.
+Action 3: Finish[Richard Nixon]
+
+Question: Which documentary is about Finnish rock groups, Adam Clayton Powell or The
+Saimaa Gesture?
+Thought 1: I need to search Adam Clayton Powell and The Saimaa Gesture, and find which
+documentary is about Finnish rock groups.
+Action 1: Search[Adam Clayton Powell]
+Observation 1 Could not find [Adam Clayton Powell]. Similar: [’Adam Clayton Powell
+III’, ’Seventh Avenue (Manhattan)’, ’Adam Clayton Powell Jr. State Office
+Building’, ’Isabel Washington Powell’, ’Adam Powell’, ’Adam Clayton Powell
+(film)’, ’Giancarlo Esposito’].
+Thought 2: To find the documentary, I can search Adam Clayton Powell (film).
+Action 2: Search[Adam Clayton Powell (film)]
+Observation 2: Adam Clayton Powell is a 1989 American documentary film directed by
+Richard Kilberg. The film is about the rise and fall of influential
+African-American politician Adam Clayton Powell Jr.[3][4] It was later aired
+as part of the PBS series The American Experience.
+Thought 3: Adam Clayton Powell (film) is a documentary about an African-American
+politician, not Finnish rock groups. So the documentary about Finnish rock
+groups must instead be The Saimaa Gesture.
+Action 3: Finish[The Saimaa Gesture]
+
+Question: What profession does Nicholas Ray and Elia Kazan have in common?
+Thought 1: I need to search Nicholas Ray and Elia Kazan, find their professions, then
+find the profession they have in common.
+Action 1: Search[Nicholas Ray]
+Observation 1: Nicholas Ray (born Raymond Nicholas Kienzle Jr., August 7, 1911 - June 16,
+1979) was an American film director, screenwriter, and actor best known for
+the 1955 film Rebel Without a Cause.
+Thought 2: Professions of Nicholas Ray are director, screenwriter, and actor. I need
+to search Elia Kazan next and find his professions.
+Action 2: Search[Elia Kazan]
+Observation 2: Elia Kazan was an American film and theatre director, producer, screenwriter
+and actor.
+Thought 3: Professions of Elia Kazan are director, producer, screenwriter, and actor.
+So profession Nicholas Ray and Elia Kazan have in common is director,
+screenwriter, and actor.
+Action 3: Finish[director, screenwriter, actor]
+
+Question: Which magazine was started first Arthur’s Magazine or First for Women?
+Thought 1: I need to search Arthur’s Magazine and First for Women, and find which was
+started first.
+Action 1: Search[Arthur’s Magazine]
+Observation 1: Arthur’s Magazine (1844-1846) was an American literary periodical published
+in Philadelphia in the 19th century.
+Thought 2: Arthur’s Magazine was started in 1844. I need to search First for Women
+next.
+Action 2: Search[First for Women]
+Observation 2: First for Women is a woman’s magazine published by Bauer Media Group in the
+USA.[1] The magazine was started in 1989.
+Thought 3: First for Women was started in 1989. 1844 (Arthur’s Magazine) < 1989 (First
+for Women), so Arthur’s Magazine was started first.
+Action 3: Finish[Arthur’s Magazine]
+
+Question: Were Pavel Urysohn and Leonid Levin known for the same type of work?
+Thought 1: I need to search Pavel Urysohn and Leonid Levin, find their types of work,
+then find if they are the same.
+Action 1: Search[Pavel Urysohn]
+Observation 1: Pavel Samuilovich Urysohn (February 3, 1898 - August 17, 1924) was a Soviet
+mathematician who is best known for his contributions in dimension theory.
+Thought 2: Pavel Urysohn is a mathematician. I need to search Leonid Levin next and
+find its type of work.
+Action 2: Search[Leonid Levin]
+Observation 2: Leonid Anatolievich Levin is a Soviet-American mathematician and computer
+scientist.
+Thought 3: Leonid Levin is a mathematician and computer scientist. So Pavel Urysohn
+and Leonid Levin have the same type of work.
+Action 3: Finish[yes]
+
+
+Question: {input}
+{agent_scratchpad}
+Now I’ll show you examples in prompts.
+
+First in this chain, it will provide the following prompt to OpenAI GPT.
+As you can see below, the former part (few-shot’s examples’ part) is the same as above, but the latter part is replaced with the target question.
+
+If you can use OpenAI playground, please input this text in prompt and see the generated text. (Here I use text-davinci-003 model with temperature 0.0 and max 256 tokens.)
+
+prompt 1
+
+
+
+Question: What is the elevation range for the area that the eastern sector of the
+Colorado orogeny extends into?
+Thought 1: I need to search Colorado orogeny, find the area that the eastern sector
+of the Colorado orogeny extends into, then find the elevation range of the
+area.
+Action 1: Search[Colorado orogeny]
+Observation 1: The Colorado orogeny was an episode of mountain building (an orogeny) in
+Colorado and surrounding areas.
+Thought 2: It does not mention the eastern sector. So I need to look up eastern
+sector.
+Action 2: Lookup[eastern sector]
+Observation 2: (Result 1 / 1) The eastern sector extends into the High Plains and is called
+the Central Plains orogeny.
+Thought 3: The eastern sector of Colorado orogeny extends into the High Plains. So I
+need to search High Plains and find its elevation range.
+Action 3: Search[High Plains]
+Observation 3: High Plains refers to one of two distinct land regions
+Thought 4: I need to instead search High Plains (United States).
+Action 4: Search[High Plains (United States)]
+Observation 4: The High Plains are a subregion of the Great Plains. From east to west, the
+High Plains rise in elevation from around 1,800 to 7,000 ft (550 to 2,130
+m).[3]
+Thought 5: High Plains rise in elevation from around 1,800 to 7,000 ft, so the answer
+is 1,800 to 7,000 ft.
+Action 5: Finish[1,800 to 7,000 ft]
+
+Question: Musician and satirist Allie Goertz wrote a song about the "The Simpsons"
+character Milhouse, who Matt Groening named after who?
+Thought 1: The question simplifies to "The Simpsons" character Milhouse is named after
+who. I only need to search Milhouse and find who it is named after.
+Action 1: Search[Milhouse]
+Observation 1: Milhouse Mussolini Van Houten is a recurring character in the Fox animated
+television series The Simpsons voiced by Pamela Hayden and created by Matt
+Groening.
+Thought 2: The paragraph does not tell who Milhouse is named after, maybe I can look up
+"named after".
+Action 2: Lookup[named after]
+Observation 2: (Result 1 / 1) Milhouse was named after U.S. president Richard Nixon, whose
+middle name was Milhous.
+Thought 3: Milhouse was named after U.S. president Richard Nixon, so the answer is
+Richard Nixon.
+Action 3: Finish[Richard Nixon]
+
+Question: Which documentary is about Finnish rock groups, Adam Clayton Powell or The
+Saimaa Gesture?
+Thought 1: I need to search Adam Clayton Powell and The Saimaa Gesture, and find which
+documentary is about Finnish rock groups.
+Action 1: Search[Adam Clayton Powell]
+Observation 1 Could not find [Adam Clayton Powell]. Similar: [’Adam Clayton Powell
+III’, ’Seventh Avenue (Manhattan)’, ’Adam Clayton Powell Jr. State Office
+Building’, ’Isabel Washington Powell’, ’Adam Powell’, ’Adam Clayton Powell
+(film)’, ’Giancarlo Esposito’].
+Thought 2: To find the documentary, I can search Adam Clayton Powell (film).
+Action 2: Search[Adam Clayton Powell (film)]
+Observation 2: Adam Clayton Powell is a 1989 American documentary film directed by
+Richard Kilberg. The film is about the rise and fall of influential
+African-American politician Adam Clayton Powell Jr.[3][4] It was later aired
+as part of the PBS series The American Experience.
+Thought 3: Adam Clayton Powell (film) is a documentary about an African-American
+politician, not Finnish rock groups. So the documentary about Finnish rock
+groups must instead be The Saimaa Gesture.
+Action 3: Finish[The Saimaa Gesture]
+
+Question: What profession does Nicholas Ray and Elia Kazan have in common?
+Thought 1: I need to search Nicholas Ray and Elia Kazan, find their professions, then
+find the profession they have in common.
+Action 1: Search[Nicholas Ray]
+Observation 1: Nicholas Ray (born Raymond Nicholas Kienzle Jr., August 7, 1911 - June 16,
+1979) was an American film director, screenwriter, and actor best known for
+the 1955 film Rebel Without a Cause.
+Thought 2: Professions of Nicholas Ray are director, screenwriter, and actor. I need
+to search Elia Kazan next and find his professions.
+Action 2: Search[Elia Kazan]
+Observation 2: Elia Kazan was an American film and theatre director, producer, screenwriter
+and actor.
+Thought 3: Professions of Elia Kazan are director, producer, screenwriter, and actor.
+So profession Nicholas Ray and Elia Kazan have in common is director,
+screenwriter, and actor.
+Action 3: Finish[director, screenwriter, actor]
+
+Question: Which magazine was started first Arthur’s Magazine or First for Women?
+Thought 1: I need to search Arthur’s Magazine and First for Women, and find which was
+started first.
+Action 1: Search[Arthur’s Magazine]
+Observation 1: Arthur’s Magazine (1844-1846) was an American literary periodical published
+in Philadelphia in the 19th century.
+Thought 2: Arthur’s Magazine was started in 1844. I need to search First for Women
+next.
+Action 2: Search[First for Women]
+Observation 2: First for Women is a woman’s magazine published by Bauer Media Group in the
+USA.[1] The magazine was started in 1989.
+Thought 3: First for Women was started in 1989. 1844 (Arthur’s Magazine) < 1989 (First
+for Women), so Arthur’s Magazine was started first.
+Action 3: Finish[Arthur’s Magazine]
+
+Question: Were Pavel Urysohn and Leonid Levin known for the same type of work?
+Thought 1: I need to search Pavel Urysohn and Leonid Levin, find their types of work,
+then find if they are the same.
+Action 1: Search[Pavel Urysohn]
+Observation 1: Pavel Samuilovich Urysohn (February 3, 1898 - August 17, 1924) was a Soviet
+mathematician who is best known for his contributions in dimension theory.
+Thought 2: Pavel Urysohn is a mathematician. I need to search Leonid Levin next and
+find its type of work.
+Action 2: Search[Leonid Levin]
+Observation 2: Leonid Anatolievich Levin is a Soviet-American mathematician and computer
+scientist.
+Thought 3: Leonid Levin is a mathematician and computer scientist. So Pavel Urysohn
+and Leonid Levin have the same type of work.
+Action 3: Finish[yes]
+
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+OpenAI will then generate the following result. (The highlighted text is the response from OpenAI GPT.)
+
+In LangChain farmework, the text under “Observation 1:” will be all ignored, and only “Thought 1:” and “Action 1:” sections will then be used for the next context.
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is an American author and journalist. He is the co-author of
+several books, including Inside the Mirage: America's Fragile Partnership
+with Saudi Arabia (2004) and The Game Player: Confessions of the CIA's
+Original Political Operative (1989).
+Thought 2: I need to search the U.S. Navy admiral David Chanoff collaborated with.
+Action 2: Search[U.S. Navy admiral]
+Observation 2: Admiral Charles R. Larson was a United States Navy four-star admiral who
+served as the United States Ambassador to the United Kingdom from 1998 to
+2001.
+Thought 3: Admiral Charles R. Larson served as the United States Ambassador to the
+United Kingdom from 1998 to 2001. So the President they served under is
+Bill Clinton.
+Action 3: Finish[Bill Clinton]
+LangChain framework parses “Action 1: Search[David Chanoff]” (see above) and searches “David Chanoff” in Wikipedia entities with external tools (in this case, docstore.search() function).
+When it has obtained the search result, it will then fill this result in “Observation 1” section as follows.
+
+I note that this search result is different from above OpenAI-generated response text.
+
+... (omitted)
+
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Next LangChain framework will prompt as follows.
+As you see, it includes the previous Observation1’s result, and then asks for “Thought 2”.
+
+I note that I have omitted large few-shot’s examples in former parts, but it also includes the same few-shot’s examples every time (i.e, it needs all historical tokens every time), because the prompt is always stateless.
+
+prompt 2
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the
+ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Thought 2:
+Then OpenAI will return the following response. (The highlighted text is the response from OpenAI GPT.)
+
+Same as above, the text under “Observation 2:” will be all ignored, and only “Thought 2:” and “Action 2:” sections are used in the chain.
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the
+ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Thought 2: David Chanoff has collaborated with a U.S. Navy admiral. I need to search
+the U.S. Navy admiral and find the ambassador to the United Kingdom.
+Action 2: Search[U.S. Navy admiral]
+Observation 2: William J. Crowe Jr. (January 2, 1925 – October 18, 2007) was an admiral in the United States Navy who served as Chairman of the Joint Chiefs of Staff under Presidents Ronald Reagan and George H. W. Bush and then as the United States Ambassador to the United Kingdom.
+Thought 3: William J. Crowe Jr. was the ambassador to the United Kingdom under
+Presidents Ronald Reagan and George H. W. Bush. So the answer is Ronald
+Reagan and George H. W. Bush.
+Action 3: Finish[Ronald Reagan and George H. W. Bush]
+LangChain framework will then search “U.S. Navy admiral” in Wikipedia with external tools, and add this result as an observation as follows. (See the following “Observation 2”.)
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the
+ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Thought 2: David Chanoff has collaborated with a U.S. Navy admiral. I need to search
+the U.S. Navy admiral and find the ambassador to the United Kingdom.
+Action 2: Search[U.S. Navy admiral]
+Observation 2: Admiral of the Navy was the highest-possible rank in the United States Navy, prior to the creation of fleet admiral in 1944. The rank is considered to be at least equivalent to that of a five-star admiral, with Admiral George Dewey being the only officer to be appointed to the rank.
+Again LangChain framework will prompt as follows.
+As you can find, it includes the previous Observation2’s result (search result) and asks for “Thought 3”.
+
+prompt 3
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the
+ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Thought 2: David Chanoff has collaborated with a U.S. Navy admiral. I need to search
+the U.S. Navy admiral and find the ambassador to the United Kingdom.
+Action 2: Search[U.S. Navy admiral]
+Observation 2: Admiral of the Navy was the highest-possible rank in the United States Navy, prior to the creation of fleet admiral in 1944. The rank is considered to be at least equivalent to that of a five-star admiral, with Admiral George Dewey being the only officer to be appointed to the rank.
+Thought 3:
+Then OpenAI will return the following response. (The highlighted text is the response from OpenAI GPT.)
+
+Same as above, the text under “Observation 3:” will also be ignored, and only “Thought 3:” and “Action 3:” sections are used in the chain.
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the
+ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Thought 2: David Chanoff has collaborated with a U.S. Navy admiral. I need to search
+the U.S. Navy admiral and find the ambassador to the United Kingdom.
+Action 2: Search[U.S. Navy admiral]
+Observation 2: Admiral of the Navy was the highest-possible rank in the United States Navy, prior to the creation of fleet admiral in 1944. The rank is considered to be at least equivalent to that of a five-star admiral, with Admiral George Dewey being the only officer to be appointed to the rank.
+Thought 3: I need to search Admiral William J. Crowe and find the ambassador to the
+United Kingdom.
+Action 3: Search[Admiral William J. Crowe]
+Observation 3: Admiral William J. Crowe Jr., KBE, DSC (January 2, 1925 – October 18, 2007) was a United States Navy admiral who served as Chairman of the Joint Chiefs of Staff under Presidents Ronald Reagan and George H. W. Bush and as the United States Ambassador to the United Kingdom under President Bill Clinton.
+Thought 4: Admiral William J. Crowe was the ambassador to the United Kingdom under
+President Bill Clinton, so the answer is Bill Clinton.
+Action 4: Finish[Bill Clinton]
+Again LangChain framework will then search “Admiral William J. Crowe” in Wikipedia with external tools, and add this result as an observation as follows.
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the
+ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Thought 2: David Chanoff has collaborated with a U.S. Navy admiral. I need to search
+the U.S. Navy admiral and find the ambassador to the United Kingdom.
+Action 2: Search[U.S. Navy admiral]
+Observation 2: Admiral of the Navy was the highest-possible rank in the United States Navy, prior to the creation of fleet admiral in 1944. The rank is considered to be at least equivalent to that of a five-star admiral, with Admiral George Dewey being the only officer to be appointed to the rank.
+Thought 3: I need to search Admiral William J. Crowe and find the ambassador to the
+United Kingdom.
+Action 3: Search[Admiral William J. Crowe]
+Observation 3: William James Crowe Jr. (January 2, 1925 – October 18, 2007) was a United States Navy admiral and diplomat who served as the 11th chairman of the Joint Chiefs of Staff under Presidents Ronald Reagan and George H. W. Bush, and as the ambassador to the United Kingdom and Chair of the Intelligence Oversight Board under President Bill Clinton.
+Again LangChain framework will prompt as follows.
+As you can find, it includes the previous Observation3’s result (search result) again and asks for “Thought 4”.
+
+prompt 4
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the
+ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Thought 2: David Chanoff has collaborated with a U.S. Navy admiral. I need to search
+the U.S. Navy admiral and find the ambassador to the United Kingdom.
+Action 2: Search[U.S. Navy admiral]
+Observation 2: Admiral of the Navy was the highest-possible rank in the United States Navy, prior to the creation of fleet admiral in 1944. The rank is considered to be at least equivalent to that of a five-star admiral, with Admiral George Dewey being the only officer to be appointed to the rank.
+Thought 3: I need to search Admiral William J. Crowe and find the ambassador to the
+United Kingdom.
+Action 3: Search[Admiral William J. Crowe]
+Observation 3: William James Crowe Jr. (January 2, 1925 – October 18, 2007) was a United States Navy admiral and diplomat who served as the 11th chairman of the Joint Chiefs of Staff under Presidents Ronald Reagan and George H. W. Bush, and as the ambassador to the United Kingdom and Chair of the Intelligence Oversight Board under President Bill Clinton.
+Thought 4:
+Then OpenAI will return the following response. (The highlighted text is the response from OpenAI GPT.)
+This time, OpenAI now provides the final answer, because the previous search result includes the answer.
+
+... few-shot examples (omitted)
+
+Question: Author David Chanoff has collaborated with a U.S. Navy admiral who served as the ambassador to the United Kingdom under which President?
+Thought 1: I need to search David Chanoff and the U.S. Navy admiral, find the
+ambassador to the United Kingdom, then find the President they served under.
+Action 1: Search[David Chanoff]
+Observation 1: David Chanoff is a noted author of non-fiction work. His work has typically involved collaborations with the principal protagonist of the work concerned. His collaborators have included; Augustus A. White, Joycelyn Elders, Đoàn Văn Toại, William J. Crowe, Ariel Sharon, Kenneth Good and Felix Zandman. He has also written about a wide range of subjects including literary history, education and foreign for The Washington Post, The New Republic and The New York Times Magazine. He has published more than twelve books.
+Thought 2: David Chanoff has collaborated with a U.S. Navy admiral. I need to search
+the U.S. Navy admiral and find the ambassador to the United Kingdom.
+Action 2: Search[U.S. Navy admiral]
+Observation 2: Admiral of the Navy was the highest-possible rank in the United States Navy, prior to the creation of fleet admiral in 1944. The rank is considered to be at least equivalent to that of a five-star admiral, with Admiral George Dewey being the only officer to be appointed to the rank.
+Thought 3: I need to search Admiral William J. Crowe and find the ambassador to the
+United Kingdom.
+Action 3: Search[Admiral William J. Crowe]
+Observation 3: William James Crowe Jr. (January 2, 1925 – October 18, 2007) was a United States Navy admiral and diplomat who served as the 11th chairman of the Joint Chiefs of Staff under Presidents Ronald Reagan and George H. W. Bush, and as the ambassador to the United Kingdom and Chair of the Intelligence Oversight Board under President Bill Clinton.
+Thought 4: Admiral William J. Crowe was the ambassador to the United Kingdom under
+President Bill Clinton, so the answer is Bill Clinton.
+Action 4: Finish[Bill Clinton]
+LangChain framework can then recognize that the final answer is “Bill Clinton”, and the chain is completed (done !).
+
+Here I summarize how LLM (OpenAI GPT-3) and external tools (in this case, search tool) interact with each others as follows. (See the following diagram.)
+LLM will provide the thoughts and next action with history of previous contexts, and external tools will perform each corresponding actions. LangChain framework will then connect these activities in the chain.
+
+
+
+In this example, we have applied few-shot examples in prompt, but you can also use zero-shot prompting by using langchain.agents.ZeroShotAgent class in LangChain.
+The following is the example of zero-shot prompt template. The prefix and suffix text can be customized in ZeroShotAgent class. (I note that the following “Search” and “Lookup” will also differ depending on specified tools.)
+
+{prefix text}
+
+Search: Search for a term in the docstore.
+Lookup: Lookup a term in the docstore.
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [Search, Lookup]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+{suffix text}
+
+Question: {input}
+{agent_scratchpad}
+Build Your Own Custom Tools and Agents
+You can use the following built-in agents in LangChain.
+(I’m using LangChain version 0.0.100, which is the latest version in this writing.)
+
+zero-shot-react-description : Multi-purpose agent optimized for zero-shot prompting (it uses langchain.agents.ZeroShotAgent class which I have mentioned in above)
+react-docstore : ReAct agent example, which uses docstore example (see above)
+self-ask-with-search : Agent which answers open questions with search tool. In LangChain, there exists a tool (wrapper class) to work with SerpApi.
+conversational-react-description : Multi-purpose agent, with which you can include conversation history in prompt
+If these built-in agents don’t matter, you can also build and define your own chains, your own external tools, and your own agents in LangChain framework.
+
+In this example, I will show you example to ask for the amount of company’s invoices and its simple calculations.
+In this example, I’ll define the following external tools.
+
+GetInvoice[name_of_company] :
+This returns the invoice amount of name_of_company from company’s database.
+Diff[list_of_quantity] :
+This is a simple calculator and returns the difference between list_of_quantity. The placeholder list_of_quantity should be delimited by space character.
+Total[list_of_quantity] :
+This is also a simple calculator and returns the total amount (addition) of list_of_quantity. The placeholder list_of_quantity should also be delimited by space character.
+With these tools, I’ll ask for the following question :
+
+“How much is the difference between the total of company C, F and the total of company A, E ?”
+
+In this example, we expect the following procedures.
+
+Get invoice amount for company C and F. (GetInvoice action)
+Calculate total amount of above C and F. (Total action)
+Get invoice amount for company A and E. (GetInvoice action)
+Calculate total amount of above A and E. (Total action)
+Calculate the difference between previous total C, F and total A, E. (Diff action)
+Note : OpenAI GPT can have the ability to perform simple calculation (such as, total, difference, etc) and you don’t need above tools for calculation (Diff and Total).
+I’ll define these primitive tools for your learning purpose in this example.
+
+To work the chain-of-thought (CoT) correctly, I will provide the following prompt with few-shot examples to OpenAI GPT (in which, the few-shot examples are included in the former parts).
+
+Question: How much is the difference between the invoice of company A and company B ?
+Thought : I need to get invoice amount of company A.
+Action : GetInvoice[A]
+Observation : 2000
+Thought : I need to get invoice amount of company B.
+Action : GetInvoice[B]
+Observation : 1500
+Thought : I need to get difference of obtained amount between company A and company B.
+Action : Diff[2000 1500]
+Observation : 500
+Thought : So the answer is 500.
+Action : Finish[500]
+
+Question: How much is the total invoice amount of company B, C, and D ?
+Thought : I need to get invoice amount of company B.
+Action : GetInvoice[B]
+Observation : 1500
+Thought : I need to get invoice amount of company C.
+Action : GetInvoice[C]
+Observation : 20000
+Thought : I need to get invoice amount of company D.
+Action : GetInvoice[D]
+Observation : 6700
+Thought : I need to get total amount of obtained amount B, C, and D.
+Action : Total[1500 20000 6700]
+Observation : 28200
+Thought : So the answer is 28200.
+Action : Finish[28200]
+
+Question: How much is the difference between company C and the total invoice amount of company A, D ?
+Thought : I need to get invoice amount of company C.
+Action : GetInvoice[C]
+Observation : 20000
+Thought : I need to get invoice amount of company A.
+Action : GetInvoice[A]
+Observation : 2000
+Thought : I need to get invoice amount of company D.
+Action : GetInvoice[D]
+Observation : 6700
+Thought : I need to get total amount of obtained amount A and D.
+Action : Total[2000 6700]
+Observation : 8700
+Thought : I need to get difference of obtained amount C and the total of A, D.
+Action : Diff[20000 8700]
+Observation : 11300
+Thought : So the answer is 11300.
+Action : Finish[11300]
+
+Question: How much is the difference between the total of company C, F and the total of company A, E ?
+Thought :
+The following is the source code for this custom ReAct chain example.
+In this source code, I have defined custom tools and custom agent, put these all components (tools, agent, and Azure OpenAI LLM) together, and finally run the chain by agent_executor.run().
+
+The custom agent will also help you in case you want to handle ReAct’s prompts with non-English language.
+
+import re
+from typing import Sequence, List, Tuple, Optional
+from langchain.agents.agent import Agent
+from langchain.prompts.prompt import PromptTemplate
+from langchain.prompts.base import BasePromptTemplate
+from langchain.tools.base import BaseTool
+from langchain.agents import Tool, initialize_agent, AgentExecutor
+from langchain.llms import AzureOpenAI
+
+##########
+# define tools
+##########
+
+company_dic = {
+  "A": 2000,
+  "B": 1500,
+  "C": 20000,
+  "D": 6700,
+  "E": 1000,
+  "F": 4100,
+}
+
+def get_invoice(company_name):
+  return company_dic[company_name]
+
+def diff(value_str):
+  str_list = value_str.split(" ")
+  assert(len(str_list) == 2)
+  int_list = [int(s) for s in str_list]
+  return str(abs(int_list[0] - int_list[1]))
+
+def total(value_str):
+  str_list = value_str.split(" ")
+  int_list = [int(s) for s in str_list]
+  return str(sum(int_list))
+
+tools = [
+  Tool(
+    name="GetInvoice",
+    func=get_invoice,
+    description="Get invoice amount of trading company.",
+  ),
+  Tool(
+    name="Diff",
+    func=diff,
+    description="Get diffrence.",
+  ),
+  Tool(
+    name="Total",
+    func=total,
+    description="Get total.",
+  ),
+]
+
+##########
+# define agent
+##########
+
+EXAMPLES = [
+  """Question: How much is the difference between the invoice of company A and company B ?
+Thought : I need to get invoice amount of company A.
+Action : GetInvoice[A]
+Observation : 2000
+Thought : I need to get invoice amount of company B.
+Action : GetInvoice[B]
+Observation : 1500
+Thought : I need to get difference of obtained amount between company A and company B.
+Action : Diff[2000 1500]
+Observation : 500
+Thought : So the answer is 500.
+Action : Finish[500]""",
+  """Question: How much is the total invoice amount of company B, C, and D ?
+Thought : I need to get invoice amount of company B.
+Action : GetInvoice[B]
+Observation 1: 1500
+Thought : I need to get invoice amount of company C.
+Action : GetInvoice[C]
+Observation : 20000
+Thought : I need to get invoice amount of company D.
+Action : GetInvoice[D]
+Observation : 6700
+Thought : I need to get total amount of obtained amount B, C, and D.
+Action : Total[1500 20000 6700]
+Observation : 28200
+Thought : So the answer is 28200.
+Action : Finish[28200]""",
+  """Question: How much is the difference between company C and the total invoice amount of company A, D ?
+Thought : I need to get invoice amount of company C.
+Action : GetInvoice[C]
+Observation : 20000
+Thought : I need to get invoice amount of company A.
+Action : GetInvoice[A]
+Observation : 2000
+Thought : I need to get invoice amount of company D.
+Action : GetInvoice[D]
+Observation : 6700
+Thought : I need to get total amount of obtained amount A and D.
+Action : Total[2000 6700]
+Observation : 8700
+Thought : I need to get difference of obtained amount C and the total of A, D.
+Action : Diff[20000 8700]
+Observation : 11300
+Thought : So the answer is 11300.
+Action : Finish[11300]""",
+]
+
+SUFFIX = """\nQuestion: {input}
+{agent_scratchpad}"""
+
+TEST_PROMPT = PromptTemplate.from_examples(
+  EXAMPLES, SUFFIX, ["input", "agent_scratchpad"]
+)
+
+class ReActTestAgent(Agent):
+  @classmethod
+  def create_prompt(cls, tools: Sequence[BaseTool]) -> BasePromptTemplate:
+    return TEST_PROMPT
+
+  @classmethod
+  def _validate_tools(cls, tools: Sequence[BaseTool]) -> None:
+    if len(tools) != 3:
+      raise ValueError("The number of tools is invalid.")
+    tool_names = {tool.name for tool in tools}
+    if tool_names != {"GetInvoice", "Diff", "Total"}:
+      raise ValueError("The name of tools is invalid.")
+
+  @property
+  def _agent_type(self) -> str:
+    return "react-test"
+
+  @property
+  def finish_tool_name(self) -> str:
+    return "Finish"
+
+  @property
+  def observation_prefix(self) -> str:
+    return f"Observation : "
+
+  @property
+  def llm_prefix(self) -> str:
+    return f"Thought : "
+
+  # This method is called by framework to parse text
+  def _extract_tool_and_input(self, text: str) -> Optional[Tuple[str, str]]:
+    action_prefix = f"Action : "
+    if not text.split("\n")[1].startswith(action_prefix):
+      return None
+    action_block = text.split("\n")[1]
+
+    action_str = action_block[len(action_prefix) :]
+    re_matches = re.search(r"(.*?)\[(.*?)\]", action_str)
+    if re_matches is None:
+      raise ValueError(f"Could not parse action directive: {action_str}")
+    return re_matches.group(1), re_matches.group(2)
+
+##########
+# run agent
+##########
+
+llm = AzureOpenAI(
+  deployment_name="davinci003-deploy",
+  model_name="text-davinci-003",
+  temperature=0,
+)
+agent = ReActTestAgent.from_llm_and_tools(
+  llm,
+  tools,
+)
+agent_executor = AgentExecutor.from_agent_and_tools(
+  agent=agent,
+  tools=tools,
+  verbose=True,
+)
+
+question = "How much is the difference between the total of company C, F and the total of company A, E ?"
+agent_executor.run(question)
+Note : For the simplification, I have fixed available tools in few-shot exemplars, but the best practice is to list available tools in prompt, in case that available tools are changed in the future.
+
+Note (Added on June 2023) : You can now use a new function-enabled model (gpt-4-0613 and gpt-3.5-turbo-0613) to more reliably perform GPT’s reasoning for function calling.
+See here for details.
+
+When you run this code, it will show the following verbose outputs.
+
+OpenAI doesn’t know the invoice amount of company E and company F (because I don’t provide these values in few-shot examples), but it can provide the correct answer, because the external functions (in this case, get_invoice(), diff(), total()) are properly used in this chain.
+
+
+
+This is a trivial example, but you can build your own practical logic, in which external tools are flexibly integrated in LLM pipeline, by ReAct framework.
+For instance, the users may ask for the recommendation of restaurants and dinner in trip assistant application, and the AI agent will then show them the results with related information – such as, estimated dinner prices, seat’s availabilities, etc – by interacting with external database.
+
+You can also find several other research papers describing the benefits of using external knowledge in LLM reasoning. (e.g, See LLM-Augmenter system.
+
+
+
+
+
+
+
+
+
+
+
+
+In my latest article, we introduced the concept of Agents powered by Large Language Models and how they overcome one of the current limitations of our beloved LLMs: the capability of taking action. 
+
+An Agent can be seen as a kind of wrapper that uses an LLM as a reasoning engine, plus it has the capability of interacting with tools that we can provide and take actions with those. Tools can be the accessed through Wikipedia rather than the possibility to interact with our File System or access the command line. If prompt was an important component while working with LLMs, with agents it becomes key. In fact, agents need to be instructed with a reasoning template, which can follow various techniques. 
+
+We’ve already seen an example of the Read-Retrieve-Read technique in my latest article. In this article, we are going to explore the ReAct approach.
+
+What is ReAct?
+ReAct (Reason and Act) approach is a general paradigm that combines reasoning and acting with LLMs. It prompts LLMs to generate verbal reasoning traces and actions for a task. 
+
+As per the Read-Retrieve-Read approach, also the ReAct paradigm implies an interaction with external tools to retrieve additional information. However, with the ReAct approach, we introduce a greater synergy between the reasoning and acting phases:
+
+The reasoning phase helps the model to set up action plans, track them, and even modify them in case (also in case of handling exceptions);
+The action phase allows the model to interact with the external world and retrieve the needed information according to the plan of the previous phase
+In the aforementioned paper, the authors show how the ReAct approach was able to overcome typical drawbacks of LLMs as hallucination and error propagation (as it has occurred in the simple version of the Chain of Thought (CoT) method of prompt engineering).
+
+Let’s see how those kinds of agents work in practice.
+
+Implementing the Agent
+LangChain makes it easier to build agents thanks to lightweight libraries which provide our LLM with the ReAct-based prompt template that makes the agent capable of both reasoning and acting. To achieve this goal, we need to install the following libraries:
+
+!pip install wikipedia
+
+from langchain import Wikipedia
+from langchain.llms import AzureOpenAI
+from langchain.agents import initialize_agent, Tool
+from langchain.agents import AgentType
+from langchain.agents.react.base import DocstoreExplorer
+In this case, as an external tool, we will use Wikipedia. However, you can decide to add further tools like search APIs such as Bing (you can read about that in my previous article) or the File System of our personal computer.
+
+Next, we can build our agent and the document store, where it will be able to navigate through in order to retrieve information. To assist the agent with the exploration of the document store, we will use the previously imported class DocstoreExplorer.
+
+docstore=DocstoreExplorer(Wikipedia())
+tools = [
+    Tool(
+        name="Search",
+        func=docstore.search,
+        description="useful for when you need to ask with search"
+    ),
+    Tool(
+        name="Lookup",
+        func=docstore.lookup,
+        description="useful for when you need to ask with lookup"
+    )
+
+]
+Finally, we need to set up the reasoning engine of our Agent. In our case, we will use a text-davinci-003 model available in the Azure OpenAI service (to set up an Azure OpenAI instance, you can read my former article here).
+
+llm = AzureOpenAI(deployment_name="text-davinci-003", openai_api_version="xxx", openai_api_key="xxx", openai_api_base="xxx")
+Great, now we have all the ingredients needed to initialize our agent. To test my agents, I will take some questions from a more recent version of the question-answering dataset HotpotQA (you can refer to the original paper here) called BeerQA. 
+
+In this experiment, I will challenge my agent on some reasoning abilities within the world of Harry Potter:
+
+#initializing our agent
+react = initialize_agent(tools, llm, agent=AgentType.REACT_DOCSTORE, verbose=True)
+#start with questions
+
+question = "Rupert Grint played the friend of which fictional character from the Harry Potter series?"
+react.run(question)
+Below you can find the whole reasoning and response:
+
+> Entering new AgentExecutor chain...
+Thought: The question simplifies to which fictional character from the Harry Potter series is Rupert Grint's friend. I need to search Rupert Grint and Harry Potter series, and find the character.
+Action: Search[Rupert Grint]
+Observation: Could not find [Rupert Grint]. Similar: ['Rupert Grint', 'Knock at the Cabin', 'Emma Watson', "Harry Potter and the Philosopher's Stone (film)", 'Harry Potter 20th Anniversary: Return to Hogwarts', 'Snatch (TV series)', 'Harry Potter (film series)', 'Servant (TV series)', 'Sick Note (TV series)', 'Georgia Groome']
+Thought: To find the character, I can search Harry Potter (film series).
+Action: Search[Harry Potter (film series)]
+Observation: Harry Potter is a film series based on the eponymous novels by J. K. Rowling. The series is produced and distributed by Warner Bros. Pictures and consists of eight fantasy films, beginning with Harry Potter and the Philosopher's Stone (2001) and culminating with Harry Potter and the Deathly Hallows – Part 2 (2011). A spin-off prequel series, planned to consist of five films, started with Fantastic Beasts and Where to Find Them (2016), marking the beginning of the Wizarding World shared media franchise.The series was mainly produced by David Heyman, and stars Daniel Radcliffe, Rupert Grint, and Emma Watson as the three leading characters: Harry Potter, Ron Weasley, and Hermione Granger. Four directors worked on the series: Chris Columbus, Alfonso Cuarón, Mike Newell, and David Yates. Michael Goldenberg wrote the screenplay for Harry Potter and the Order of the Phoenix (2007), while the remaining films' screenplays were written by Steve Kloves. Production took place over ten years, with the main story arc following Harry's quest to overcome his arch-enemy Lord Voldemort.Harry Potter and the Deathly Hallows, the seventh and final novel in the series, was adapted into two feature-length parts. Part 1 was released in November 2010, and Part 2 was released in July 2011.Philosopher's Stone and Deathly Hallows – Part 2 are among the 50 highest-grossing films of all time—at 50th- and 16th-highest, respectively—with both grossing over $1 billion. It is the fourth-highest-grossing film series, with $7.7 billion in worldwide receipts.
+Thought: Rupert Grint played the friend of Harry Potter, Ron Weasley.
+Action: Finish[Ron Weasley]
+
+> Finished chain.
+
+'Ron Weasley'
+Now, you might think that this was a very easy question to address (and be right). Let’s challenge it with some more complex reasoning tasks:
+
+question = "Which of the Harry Potter film series main stars debuted in stage acting first?"
+react.run(question)
+Below is the response:
+
+> Entering new AgentExecutor chain...
+Thought: I need to search the main stars of the Harry Potter film series, find their stage acting debut, then find which debuted first.
+Action: Search[Harry Potter film series main stars]
+Observation: Harry Potter is a film series based on the eponymous novels by J. K. Rowling. The series is produced and distributed by Warner Bros. Pictures and consists of eight fantasy films, beginning with Harry Potter and the Philosopher's Stone (2001) and culminating with Harry Potter and the Deathly Hallows – Part 2 (2011). A spin-off prequel series, planned to consist of five films, started with Fantastic Beasts and Where to Find Them (2016), marking the beginning of the Wizarding World shared media franchise.The series was mainly produced by David Heyman, and stars Daniel Radcliffe, Rupert Grint, and Emma Watson as the three leading characters: Harry Potter, Ron Weasley, and Hermione Granger. Four directors worked on the series: Chris Columbus, Alfonso Cuarón, Mike Newell, and David Yates. Michael Goldenberg wrote the screenplay for Harry Potter and the Order of the Phoenix (2007), while the remaining films' screenplays were written by Steve Kloves. Production took place over ten years, with the main story arc following Harry's quest to overcome his arch-enemy Lord Voldemort.Harry Potter and the Deathly Hallows, the seventh and final novel in the series, was adapted into two feature-length parts. Part 1 was released in November 2010, and Part 2 was released in July 2011.Philosopher's Stone and Deathly Hallows – Part 2 are among the 50 highest-grossing films of all time—at 50th- and 16th-highest, respectively—with both grossing over $1 billion. It is the fourth-highest-grossing film series, with $7.7 billion in worldwide receipts.
+Thought: The main stars of the Harry Potter film series are Daniel Radcliffe, Rupert Grint, and Emma Watson. I need to search each of them and find their stage acting debut.
+Action: Search[Daniel Radcliffe]
+Observation: Daniel Jacob Radcliffe (born 23 July 1989) is an English actor. He rose to fame at age twelve, when he began portraying Harry Potter in the film series of the same name. Over his career, Radcliffe has received various awards and nominations.
+Radcliffe made his acting debut at age 10 in the BBC One television film David Copperfield (1999), followed by his feature film debut in The Tailor of Panama (2001). The same year, he starred as Harry Potter in the film adaptation of the J.K. Rowling fantasy novel, Harry Potter and the Philosopher's Stone. Over the next decade, he played the eponymous role in seven sequels, culminating with Harry Potter and the Deathly Hallows – Part 2 (2011). During this period, he became one of the world's highest-paid actors and gained worldwide fame, popularity, and critical acclaim.
+Following the success of Harry Potter, Radcliffe challenged himself acting in a variety of genres starring in What If? (2013), The Woman in Black (2012), Victor Frankenstein (2015), Swiss Army Man (2016), Now You See Me 2 (2016), and The Lost City (2022). He also portrayed Allen Ginsberg in the drama film Kill Your Darlings (2013), FBI agent Nate Foster in the crime drama Imperium (2016), and Weird Al Yankovic in the musical film Weird: The Al Yankovic Story (2022). Since 2019, he has starred in the TBS anthology series Miracle Workers.
+Radcliffe branched out to stage acting in 2007, starring in the West End and Broadway productions of Equus. He returned to Broadway in the musical How to Succeed in Business Without Really Trying (2011), earning a Grammy Award nomination, and Martin McDonagh's The Cripple of Inishmaan (2014), the satirical play The Lifespan of a Fact (2018), and Stephen Sondheim's Merrily We Roll Along (2023). He returned to the West End in revivals of Tom Stoppard's Rosencrantz and Guildenstern Are Dead (2017), and Samuel Becket's Endgame (2020).
+Radcliffe has contributed to many charities, including Demelza Hospice Care for Children and the Trevor Project; the latter awarded him its Hero Award in 2011 for his advocacy with LGBTQ youth.
+Thought: Daniel Radcliffe made his stage acting debut in the West End and Broadway productions of Equus in 2007. I need to search Rupert Grint and Emma Watson next and find their stage acting debut.
+Action: Search[Rupert Grint]
+Observation: Could not find [Rupert Grint]. Similar: ['Rupert Grint', 'Knock at the Cabin', 'Emma Watson', "Harry Potter and the Philosopher's Stone (film)", 'Harry Potter 20th Anniversary: Return to Hogwarts', 'Snatch (TV series)', 'Harry Potter (film series)', 'Servant (TV series)', 'Sick Note (TV series)', 'Georgia Groome']
+Thought: To find Rupert Grint's stage acting debut, I can search Rupert Grint.
+Action: Search[Rupert Grint]
+Observation: Could not find [Rupert Grint]. Similar: ['Rupert Grint', 'Knock at the Cabin', 'Emma Watson', "Harry Potter and the Philosopher's Stone (film)", 'Harry Potter 20th Anniversary: Return to Hogwarts', 'Snatch (TV series)', 'Harry Potter (film series)', 'Servant (TV series)', 'Sick Note (TV series)', 'Georgia Groome']
+Thought: To find Rupert Grint's stage acting debut, I can search Rupert Grint stage acting.
+Action: Search[Rupert Grint stage acting]
+Observation: Rupert Alexander Lloyd Grint (; born 24 August 1988) is an English actor. Grint rose to fame for his role as Ron Weasley in the Harry Potter film series, for which he was cast at age eleven, having previously acted only in school plays and his local theatre group. Since then, he continued his work on film, television, and theatre.
+Beginning in 2002, he began to work outside of the Harry Potter franchise, with a co-leading role in Thunderpants. He starred in the dramedy Driving Lessons (2006) and the drama Cherrybomb (2009) and co-starred in the comedy Wild Target (2010). After the Harry Potter series concluded, he appeared in the films Into the White (2012), Charlie Countryman (2013), CBGB (2013), and Moonwalkers (2015). He made his stage debut in 2013 in Mojo at the Harold Pinter Theatre. He executive-produced and starred in the television series Snatch, based on the film of the same name. He has also starred in the black comedy series Sick Note, the mystery thriller miniseries The ABC Murders, and the psychological horror series Servant.
+Thought: Rupert Grint made his stage acting debut in Mojo at the Harold Pinter Theatre in 2013. I need to search Emma Watson next and find her stage acting debut.
+Action: Search[Emma Watson]
+Observation: Emma Charlotte Duerre Watson (born 15 April 1990) is an English actress, model and activist. Known for her roles in both blockbusters and independent films, as well as for her women's rights work, she has received a selection of accolades, including a Young Artist Award and three MTV Movie Awards. Watson has been ranked among the world's highest-paid actresses by Forbes and Vanity Fair, and was named one of the 100 most influential people in the world by Time magazine in 2015.Watson attended the Dragon School and trained in acting at the Oxford branch of Stagecoach Theatre Arts. As a child, she rose to stardom after landing her first professional acting role as Hermione Granger in the Harry Potter film series, having previously acted only in school plays. Watson also starred in the 2007 television adaptation of the novel Ballet Shoes and lent her voice to The Tale of Despereaux (2008). After the final Harry Potter film, she took on a supporting role in My Week with Marilyn (2011), before starring as Sam, a flirtatious, free-spirited student in The Perks of Being a Wallflower (2012), to critical success. Further acclaim came from portraying Alexis Neiers in Sofia Coppola's The Bling Ring (2013) and the titular character's adoptive daughter in Darren Aronofsky's biblical epic Noah (2014). That same year, Watson was honoured by the British Academy of Film and Television Arts, winning British Artist of the Year. She also starred as Belle in the live-action musical romantic fantasy Beauty and the Beast (2017), and Meg March in Greta Gerwig's coming-of-age drama Little Women (2019).
+From 2011 to 2014, Watson split her time between working on films and continuing her education, graduating from Brown University with a bachelor's degree in English literature in May 2014. That year, she was appointed a UN Women Goodwill Ambassador and helped launch the UN Women campaign HeForShe, which advocates for gender equality. In 2018, she helped launch Time's Up UK as a founding member. Watson was appointed to a G7 advisory body for women's rights in 2019, consulting with leaders on foreign policy. Her modelling work has included campaigns for Burberry and Lancôme. She also lent her name to a clothing line for the sustainable brand People Tree. In 2020, she joined the board of directors of Kering, a luxury brand group, in her capacity as an advocate for sustainable fashion.
+Thought: Emma Watson made her stage acting debut in the 2007 television adaptation of the novel Ballet Shoes. Daniel Radcliffe made his stage acting debut in 2007 (Equus), while Rupert Grint and Emma Watson made their stage acting debut in 2013 (Mojo and Ballet Shoes, respectively). So Daniel Radcliffe debuted in stage acting first.
+Action: Finish[Daniel Radcliffe]
+
+> Finished chain.
+
+'Daniel Radcliffe'
+In this case, you can see that the Agent needs to plan several steps to find the right information. It is incredible to see how it can formulate the most effective query for the tool it is enabled to navigate through. At the end of the Chain of Thoughts, it gives the correct answer.
+
+For the sake of HP fandom (which I’m part of), let’s also ask something that it is only present within the books:
+
+question = "In Harry Potter and the Goblet of Fire, in the third task to get to the Goblet a riddle of which magical creature needs to be solved?"
+react.run(question)
+Below is the result:
+
+> Entering new AgentExecutor chain...
+Thought: I need to search Harry Potter and the Goblet of Fire, find the third task, and find the magical creature.
+Action: Search[Harry Potter and the Goblet of Fire]
+Observation: Harry Potter and the Goblet of Fire is a fantasy novel written by British author J. K. Rowling and the fourth novel in the Harry Potter series. It follows Harry Potter, a wizard in his fourth year at Hogwarts School of Witchcraft and Wizardry, and the mystery surrounding the entry of Harry's name into the Triwizard Tournament, in which he is forced to compete.
+The book was published in the United Kingdom by Bloomsbury and in the United States by Scholastic. In both countries, the release date was 8 July 2000. This was the first time a book in the series was published in both countries at the same time. The novel won a Hugo Award, the only Harry Potter novel to do so, in 2001. The book was adapted into a film, released worldwide on 18 November 2005, and a video game by Electronic Arts.
+Thought: The paragraph does not mention the third task. I need to look up third task.
+Action: Lookup[third task]
+Observation: No Results
+Thought: I need to instead search Harry Potter and the Goblet of Fire third task.
+Action: Search[Harry Potter and the Goblet of Fire third task]
+Observation: Harry Potter and the Goblet of Fire is a fantasy novel written by British author J. K. Rowling and the fourth novel in the Harry Potter series. It follows Harry Potter, a wizard in his fourth year at Hogwarts School of Witchcraft and Wizardry, and the mystery surrounding the entry of Harry's name into the Triwizard Tournament, in which he is forced to compete.
+The book was published in the United Kingdom by Bloomsbury and in the United States by Scholastic. In both countries, the release date was 8 July 2000. This was the first time a book in the series was published in both countries at the same time. The novel won a Hugo Award, the only Harry Potter novel to do so, in 2001. The book was adapted into a film, released worldwide on 18 November 2005, and a video game by Electronic Arts.
+Thought: The third task is to get to the Goblet, and the riddle of a magical creature needs to be solved. The magical creature is a sphinx.
+Action: Finish[sphinx]
+
+> Finished chain.
+
+'sphinx'
+Well, we can say that our Agent did a pretty job. The next challenge will be navigating through the Marvel multiverse 😎
+
+Stay tuned for the next article
+
+
+
+
+
+
+
+
